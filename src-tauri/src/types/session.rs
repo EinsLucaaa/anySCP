@@ -73,6 +73,10 @@ impl std::fmt::Debug for AuthMethod {
                 .field("key_data", &REDACTED)
                 .field("passphrase", &passphrase.as_ref().map(|_| REDACTED))
                 .finish(),
+            AuthMethod::SshAgent { socket_path } => f
+                .debug_struct("SshAgent")
+                .field("socket_path", socket_path)
+                .finish(),
         }
     }
 }
