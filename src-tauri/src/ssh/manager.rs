@@ -25,6 +25,74 @@ type EstablishedConn = (
 type EstablishFuture<'a> =
     Pin<Box<dyn Future<Output = Result<EstablishedConn, SshError>> + Send + 'a>>;
 
+/// Asks an SSH agent for its identities and parses the reply ourselves.
+///
+/// `AgentClient::request_identities` fails for the whole list as soon as one
+/// key can't be parsed (e.g. an RSA key beyond the supported size), which
+/// hides every usable key. Here, unparsable keys are skipped instead.
+#[cfg(any(unix, windows))]
+async fn request_identities_lenient<S>(
+    stream: &mut S,
+) -> Result<Vec<russh_keys::key::PublicKey>, std::io::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const REQUEST_IDENTITIES: u8 = 11;
+    const IDENTITIES_ANSWER: u8 = 12;
+    const MAX_REPLY: usize = 1 << 20;
+
+    stream.write_all(&[0, 0, 0, 1, REQUEST_IDENTITIES]).await?;
+    stream.flush().await?;
+
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len == 0 || len > MAX_REPLY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid SSH agent reply length",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+
+    if buf[0] != IDENTITIES_ANSWER {
+        return Ok(Vec::new());
+    }
+
+    fn read_u32(buf: &[u8], pos: &mut usize) -> Option<u32> {
+        let b = buf.get(*pos..*pos + 4)?;
+        *pos += 4;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn read_string<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+        let n = read_u32(buf, pos)? as usize;
+        let end = pos.checked_add(n)?;
+        let s = buf.get(*pos..end)?;
+        *pos = end;
+        Some(s)
+    }
+
+    let mut pos = 1;
+    let count = read_u32(&buf, &mut pos).unwrap_or(0);
+    let mut keys = Vec::new();
+    for _ in 0..count {
+        let (Some(blob), Some(_comment)) =
+            (read_string(&buf, &mut pos), read_string(&buf, &mut pos))
+        else {
+            break;
+        };
+        match russh_keys::key::parse_public_key(blob, Some(russh_keys::key::SignatureHash::SHA2_512))
+        {
+            Ok(k) => keys.push(k),
+            Err(e) => tracing::debug!("skipping unsupported SSH agent key: {e}"),
+        }
+    }
+    Ok(keys)
+}
+
 /// A bare (PTY-less) SSH connection used by the SFTP layer.
 struct BareConn {
     /// The authenticated target handle, shared with the SFTP layer.
@@ -414,8 +482,8 @@ impl SshManager {
                 tracing::debug!("SSH agent socket not reachable: {candidate}");
                 continue;
             };
-            let mut agent = AgentClient::connect(stream);
-            match agent.request_identities().await {
+            let mut stream = stream;
+            match request_identities_lenient(&mut stream).await {
                 Ok(ids) if !ids.is_empty() => {
                     tracing::debug!("using SSH agent at {candidate} ({} key(s))", ids.len());
                     sock = candidate.clone();
@@ -428,10 +496,9 @@ impl SshManager {
         }
 
         if identities.is_empty() {
-            let tried = candidates.join(", ");
-            return Err(SshError::AuthenticationFailed(format!(
+            return Err(SshError::AuthenticationFailed(
                 "SSH agent holds no keys — run `ssh-add` or check gpg-agent config".into(),
-            )));
+            ));
         }
 
         let n = identities.len();
@@ -486,8 +553,10 @@ impl SshManager {
         let pipe = socket_path.unwrap_or(DEFAULT_PIPE);
 
         // ── Windows OpenSSH named pipe ─────────────────────────────────────
-        if let Ok(mut first) = AgentClient::connect_named_pipe(pipe).await {
-            let identities = first.request_identities().await.unwrap_or_default();
+        if let Ok(mut first) = tokio::net::windows::named_pipe::ClientOptions::new().open(pipe) {
+            let identities = request_identities_lenient(&mut first)
+                .await
+                .unwrap_or_default();
             let n = identities.len();
 
             for pubkey in identities {
